@@ -1,0 +1,185 @@
+function runExtraction() {
+  const ss = SpreadsheetApp.getActive();
+
+  // === Correct source sheet name ===
+  let scanSheet = ss.getSheetByName('Daily SF Stock Google Sheet-scans');
+  if (!scanSheet) {
+    SpreadsheetApp.getUi().alert("Sheet 'Daily SF Stock Google Sheet-scans' not found!");
+    return;
+  }
+
+  let outSheet = ss.getSheetByName('Processed OCR Results');
+  if (!outSheet) outSheet = ss.insertSheet('Processed OCR Results');
+
+  let lastRow = scanSheet.getLastRow();
+  if (lastRow < 2) {
+    outSheet.clear();
+    outSheet.getRange(1,1,1,6).setValues([
+      ["ScanID","ServiceName","User","ScannedTime",
+       "PCs","ExtrusionDate","ExpDate","MfgDate","BatchNo","IDH"]
+    ]);
+    return;
+  }
+
+  let data = scanSheet.getRange(2, 1, lastRow-1, 24).getValues();
+  let questionSet = new Set();
+  let parsedRows = [];
+
+  // First pass: collect all dynamic question names
+  data.forEach(row => {
+    [12, 14, 16, 18].forEach(i => {
+      if (row[i] && row[i].toString().trim() !== "")
+        questionSet.add(row[i].toString().trim());
+    });
+  });
+
+  let questionHeaders = Array.from(questionSet);
+
+  // Second pass: parse each scan row
+  data.forEach(row => {
+
+    let scanValue = row[7];
+    if (!scanValue) return;
+
+    let scanID      = row[0];
+    let serviceName = row[2];
+    let username    = row[6];
+    let scannedTime = row[10];
+
+    let upper = String(scanValue).toUpperCase();
+
+    let cleaned = upper
+      .replace(/([0-9])O(?!PC|PCS)/g, "$10")
+      .replace(/O([0-9])/g, "0$1");
+
+    let matches = [...cleaned.matchAll(/([0-9]{2}\/[0-9]{2}\/[0-9]{4})|([0-9]{6,})|([0-9]+)/g)]
+                  .map(m => m[0]);
+
+    let dates = [], longNos = [], smallNos = [];
+    matches.forEach(val=>{
+      if(val.match(/[0-9]{2}\/[0-9]{2}\/[0-9]{4}/)) dates.push(val);
+      else if(val.length>=8) longNos.push(val);
+      else smallNos.push(val);
+    });
+
+    dates.sort((a,b)=>{
+      let ad=a.split("/").reverse().join("");
+      let bd=b.split("/").reverse().join("");
+      return ad>bd?1:-1;
+    });
+
+    let mfgDate = dates[0] || "";
+    let extDate = dates[1] || "";
+    let expDate = dates[2] || "";
+
+    // ===== PCS engine =====
+    let pcs="";
+    let pcsCandidates=[];
+
+    let pcsClean=upper
+      .replace(/([0-9])\s*O\s*PC/g,"$10PC")
+      .replace(/([0-9])\s*O\s*PCS/g,"$10PCS")
+      .replace(/([0-9])\s*0\s*PC/g,"$10PC")
+      .replace(/([0-9])\s*0\s*PCS/g,"$10PCS");
+
+    let strongMatches=[...pcsClean.matchAll(/([0-9]+)\s*(PC|PCS)/g)];
+    strongMatches.forEach(m=>{
+      let v=parseInt(m[1],10);
+      if(v>=1&&v<=100) pcsCandidates.push({value:v,score:100});
+    });
+
+    let pcPos=pcsClean.indexOf("PC");
+    if(pcPos!=-1){
+      smallNos.forEach(num=>{
+        let v=parseInt(num,10);
+        if(v>=1&&v<=100){
+          let pos=cleaned.indexOf(num);
+          let dist=Math.abs(pos-pcPos);
+          pcsCandidates.push({value:v,score:Math.max(60-dist,10)});
+        }
+      });
+    }
+
+    let validSmall = smallNos
+      .map(x=>parseInt(x,10))
+      .filter(x=>x>=1&&x<=100);
+
+    if(validSmall.length===1) pcsCandidates.push({value:validSmall[0],score:80});
+
+    pcsCandidates = pcsCandidates.map(c=>{
+      if([10,20,25,30,40,50].includes(c.value)) c.score+=10;
+      return c;
+    });
+
+    pcsCandidates.sort((a,b)=>b.score-a.score);
+    if(pcsCandidates.length) pcs=pcsCandidates[0].value.toString();
+
+    let batch = longNos.sort((a,b)=>b.length-a.length)[0] || "";
+    let idh="";
+
+    let idhMatch=cleaned.match(/(IDH|OH|ID4)[: ]*([0-9]{5,10})/);
+    if(idhMatch) idh=idhMatch[2];
+    else {
+      let candidates=longNos.concat(smallNos)
+        .map(x=>x.toString())
+        .filter(n=>n!==pcs&&n!==batch&&n.length>=6&&n.length<=10);
+      if(candidates.length) idh=candidates[0];
+    }
+
+    // ===== Dynamic Questions → Answers =====
+    let qaMap={};
+    questionHeaders.forEach(q => qaMap[q] = "");
+
+    let qIdx=[12,14,16,18];
+    let aIdx=[13,15,17,19];
+
+    for(let i=0;i<4;i++){
+      let q=row[qIdx[i]];
+      let a=row[aIdx[i]];
+      if(q && qaMap.hasOwnProperty(q.toString().trim()))
+        qaMap[q.toString().trim()] = a || "";
+    }
+
+    let outRow = [
+      scanID, serviceName, username, scannedTime,
+      pcs, extDate, expDate, mfgDate, batch, idh
+    ];
+    questionHeaders.forEach(q => outRow.push(qaMap[q]));
+
+    parsedRows.push(outRow);
+  });
+
+  // ----- Header -----
+  let header = [
+    "ScanID","ServiceName","User","ScannedTime",
+    "PCs","ExtrusionDate","ExpDate","MfgDate","BatchNo","IDH"
+  ];
+  header = header.concat(questionHeaders);
+
+  outSheet.clear();
+  outSheet.getRange(1,1,1,header.length).setValues([header]);
+
+  if(parsedRows.length > 0){
+    outSheet.getRange(2,1,parsedRows.length,parsedRows[0].length).setValues(parsedRows);
+  }
+}
+
+// 
+function onEdit(e) {
+  if (!e || !e.range) return;
+
+  const sheet = e.range.getSheet();
+  if (sheet.getName() !== 'Daily SF Stock Google Sheet-scans') return;
+
+  // re-run extraction if Scan Value column (8) was changed
+  if (e.range.getColumn() === 8 && e.range.getRow() >= 2) {
+    runExtraction();
+  }
+}
+
+// manual menu
+function onOpen() {
+  SpreadsheetApp.getUi().createMenu("OCR Tools")
+    .addItem("Run Extractor","runExtraction")
+    .addToUi();
+}
